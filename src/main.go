@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -9,159 +10,168 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
-
-	"golang.org/x/net/proxy"
 )
 
-// countingWriter and countingReader
-// to record the number of bytes written and read
-type countingWriter struct {
-	writer       io.Writer
+// countingConn wraps a net.Conn and counts the number of bytes written and read.
+type countingConn struct {
+	net.Conn
 	bytesWritten int64
+	bytesRead    int64
 }
 
-type countingReader struct {
-	reader    io.Reader
-	bytesRead int64
-}
-
-// Write writes the given byte slice to the underlying writer and updates the bytesWritten counter.
-//
-// Parameter p is the byte slice to be written.
-// Returns the number of bytes written and any error that occurred during the write operation.
-func (c *countingWriter) Write(p []byte) (int, error) {
-	n, err := c.writer.Write(p)
+// Write wraps the underlying net.Conn's Write method, counting the bytes written.
+func (c *countingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
 	atomic.AddInt64(&c.bytesWritten, int64(n))
 	return n, err
 }
 
-// Read reads from the underlying reader and updates the bytesRead counter.
-//
-// Parameter p is the byte slice to be read from.
-// Returns the number of bytes read and any error that occurred during the read operation.
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.reader.Read(p)
+// Read wraps the underlying net.Conn's Read method, counting the bytes read.
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
 	atomic.AddInt64(&c.bytesRead, int64(n))
 	return n, err
 }
 
-var blacklist map[string]struct{}
+var blacklist map[string]bool
 
-func loadBlacklist() error {
-	file, err := os.Open("blacklist.txt")
+func loadBlacklist(filename string) error {
+	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	blacklist = make(map[string]struct{})
+	blacklist = make(map[string]bool)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			blacklist[line] = struct{}{}
-		}
+		blacklist[strings.TrimSpace(scanner.Text())] = true
 	}
 
 	return scanner.Err()
 }
 
-func isBlacklisted(address string) bool {
-	_, blacklisted := blacklist[address]
-	return blacklisted
+func isBlocked(host string) bool {
+	for blockedURL := range blacklist {
+		if strings.HasPrefix(host, blockedURL) {
+			return true
+		}
+	}
+	return false
 }
 
-func handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// log request
-	log.Printf("[HTTP] [Client %s], target: %s", r.RemoteAddr, r.URL.String())
-	if isBlacklisted(r.URL.Host) {
-		w.WriteHeader(http.StatusTeapot)
-		return
-	}
-	client := &http.Client{}
-
-	resp, err := client.Do(r)
+func extractIPv4FromRemoteAddr(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	log.Printf("remoteAddr: %s, host: %s", remoteAddr, host)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return remoteAddr // if error, return original remoteAddr
 	}
-	defer resp.Body.Close()
 
-	// create countingWriter to record the number of bytes written
-	cw := &countingWriter{writer: w}
-
-	for k, v := range resp.Header {
-		w.Header()[k] = v
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return remoteAddr
 	}
-	w.WriteHeader(resp.StatusCode)
 
-	io.Copy(cw, resp.Body)
-	log.Printf("HTTP request to %s transferred %d bytes\n", r.URL.String(), cw.bytesWritten)
+	// if it is an IPv4 address
+	if ip.To4() != nil {
+		return ip.String()
+	}
+
+	// if it is an IPv4-mapped IPv6 address
+	if ip.IsLoopback() && strings.HasPrefix(ip.String(), "::ffff:") {
+		return ip.String()[7:]
+	}
+
+	return remoteAddr
 }
 
-func handleSOCKS(conn net.Conn, targetAddr string) {
-	// log request
-	log.Printf("[SOCKS] [Client %s] target: %s", conn.RemoteAddr().String(), targetAddr)
+func handleClientConnection(client net.Conn) {
+	defer client.Close()
+	// extract IPv4 from remoteAddr
+	remoteAddr := extractIPv4FromRemoteAddr(client.RemoteAddr().String())
+	log.Printf("[Client %s] Received connection", remoteAddr)
 
-	host, _, err := net.SplitHostPort(targetAddr)
+	// read request
+	clientReader := bufio.NewReader(client)
+	req, err := http.ReadRequest(clientReader)
 	if err != nil {
-		log.Printf("[SOCKS] [Client %s] Failed to parse target address: %s", conn.RemoteAddr().String(), err)
+		log.Printf("[Client %s] Error reading request: %v", remoteAddr, err)
 		return
 	}
 
-	if isBlacklisted(host) {
-		conn.Write([]byte("HTTP/1.1 418 I'm a teapot\r\n\r\n"))
-		conn.Close()
+	// only support CONNECT
+	if req.Method != "CONNECT" {
+		log.Printf("[Client %s]Invalid request method: %s", remoteAddr, req.Method)
 		return
 	}
-	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:1080", nil, proxy.Direct)
+
+	// parse target host and port
+	hostPort := req.URL.Host
+	log.Printf("[Client %s] Target host: %s", remoteAddr, hostPort)
+	if isBlocked(hostPort) {
+		log.Printf("[Client: %s] Blocked host: %s", remoteAddr, hostPort)
+		// send teapot response
+		client.Write([]byte("HTTP/1.1 418 I'm a teapot\r\n\r\n"))
+		return
+	}
+	if !strings.Contains(hostPort, ":") {
+		hostPort = hostPort + ":443" // https as default
+	}
+
+	// connect to server
+	server, err := net.Dial("tcp", hostPort)
 	if err != nil {
-		log.Printf("[SOCKS] [Client %s] Failed to create SOCKS5 dialer: %s", conn.RemoteAddr().String(), err)
+		log.Printf("[Client %s] Error connecting to %v: %v", remoteAddr, hostPort, err)
 		return
 	}
+	defer server.Close()
 
-	targetConn, err := dialer.Dial("tcp", targetAddr)
-	if err != nil {
-		log.Printf("[SOCKS] [Client %s] Failed to connect to target: %s", conn.RemoteAddr().String(), err)
-		return
-	}
-	defer targetConn.Close()
+	// log data transferred
+	clientCounting := &countingConn{Conn: client}
+	serverCounting := &countingConn{Conn: server}
 
-	cr := &countingReader{reader: conn}
-	cw := &countingWriter{writer: targetConn}
+	resp := "HTTP/1.1 200 Connection Established\r\n"
+	resp += "Proxy-agent: go-tunnel-proxy\r\n"
+	resp += "Connection: close\r\n\r\n"
+	client.Write([]byte(resp))
 
-	// 使用 countingReader 和 countingWriter 记录传输的字节数
-	go io.Copy(cw, cr)
-	io.Copy(conn, targetConn)
+	go io.Copy(server, client)
+	io.Copy(client, server)
 
-	log.Printf("SOCKS request to %s transferred %d bytes in and %d bytes out\n", targetAddr, cr.bytesRead, cw.bytesWritten)
+	log.Printf(
+		"[Client %s] Data transferred: sent %d bytes, received %d bytes",
+		remoteAddr,
+		clientCounting.bytesWritten,
+		serverCounting.bytesRead,
+	)
 }
 
 func main() {
-	err := loadBlacklist()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "10000" // default port
+	}
+
+	err := loadBlacklist("blacklist.txt")
 	if err != nil {
 		log.Fatalf("Failed to load blacklist: %v", err)
 	}
-	http.HandleFunc("/", handleHTTP)
-
-	go func() {
-		log.Println("Starting HTTP/HTTPS proxy on :8080")
-		log.Fatal(http.ListenAndServe(":8080", nil))
-	}()
-
-	listener, err := net.Listen("tcp", ":1081")
+	listenAddr := fmt.Sprintf(":%s", port)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatal("Failed to start SOCKS proxy:", err)
+		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+		return
 	}
-	log.Println("Starting SOCKS proxy on :1081")
+	defer listener.Close()
 
+	log.Printf("Listening on %s", listenAddr)
 	for {
-		conn, err := listener.Accept()
+		client, err := listener.Accept()
 		if err != nil {
-			log.Println("Failed to accept connection:", err)
+			log.Println("Error accepting:", err)
 			continue
 		}
 
-		go handleSOCKS(conn, conn.RemoteAddr().String())
+		go handleClientConnection(client)
 	}
 }
