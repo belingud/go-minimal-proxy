@@ -1,177 +1,51 @@
-package main
+package handler
 
 import (
-	"bufio"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
 	"os"
-	"strings"
-	"sync/atomic"
+	"strconv"
+
+	"github.com/appwrite/sdk-for-go/appwrite"
+	"github.com/open-runtimes/types-for-go/v4/openruntimes"
 )
 
-// countingConn wraps a net.Conn and counts the number of bytes written and read.
-type countingConn struct {
-	net.Conn
-	bytesWritten int64
-	bytesRead    int64
+type Response struct {
+	Motto       string `json:"motto"`
+	Learn       string `json:"learn"`
+	Connect     string `json:"connect"`
+	GetInspired string `json:"getInspired"`
 }
 
-// Write wraps the underlying net.Conn's Write method, counting the bytes written.
-func (c *countingConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	atomic.AddInt64(&c.bytesWritten, int64(n))
-	return n, err
-}
-
-// Read wraps the underlying net.Conn's Read method, counting the bytes read.
-func (c *countingConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	atomic.AddInt64(&c.bytesRead, int64(n))
-	return n, err
-}
-
-var blacklist map[string]bool
-
-func loadBlacklist(filename string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	blacklist = make(map[string]bool)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		blacklist[strings.TrimSpace(scanner.Text())] = true
-	}
-
-	return scanner.Err()
-}
-
-func isBlocked(host string) bool {
-	for blockedURL := range blacklist {
-		if strings.HasPrefix(host, blockedURL) {
-			return true
-		}
-	}
-	return false
-}
-
-func extractIPv4FromRemoteAddr(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	log.Printf("remoteAddr: %s, host: %s", remoteAddr, host)
-	if err != nil {
-		return remoteAddr // if error, return original remoteAddr
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return remoteAddr
-	}
-
-	// if it is an IPv4 address
-	if ip.To4() != nil {
-		return ip.String()
-	}
-
-	// if it is an IPv4-mapped IPv6 address
-	if ip.IsLoopback() && strings.HasPrefix(ip.String(), "::ffff:") {
-		return ip.String()[7:]
-	}
-
-	return remoteAddr
-}
-
-func handleClientConnection(client net.Conn) {
-	defer client.Close()
-	// extract IPv4 from remoteAddr
-	remoteAddr := extractIPv4FromRemoteAddr(client.RemoteAddr().String())
-	log.Printf("[Client %s] Received connection", remoteAddr)
-
-	// read request
-	clientReader := bufio.NewReader(client)
-	req, err := http.ReadRequest(clientReader)
-	if err != nil {
-		log.Printf("[Client %s] Error reading request: %v", remoteAddr, err)
-		return
-	}
-
-	// only support CONNECT
-	if req.Method != "CONNECT" {
-		log.Printf("[Client %s]Invalid request method: %s", remoteAddr, req.Method)
-		return
-	}
-
-	// parse target host and port
-	hostPort := req.URL.Host
-	log.Printf("[Client %s] Target host: %s", remoteAddr, hostPort)
-	if isBlocked(hostPort) {
-		log.Printf("[Client: %s] Blocked host: %s", remoteAddr, hostPort)
-		// send teapot response
-		client.Write([]byte("HTTP/1.1 418 I'm a teapot\r\n\r\n"))
-		return
-	}
-	if !strings.Contains(hostPort, ":") {
-		hostPort = hostPort + ":443" // https as default
-	}
-
-	// connect to server
-	server, err := net.Dial("tcp", hostPort)
-	if err != nil {
-		log.Printf("[Client %s] Error connecting to %v: %v", remoteAddr, hostPort, err)
-		return
-	}
-	defer server.Close()
-
-	// log data transferred
-	clientCounting := &countingConn{Conn: client}
-	serverCounting := &countingConn{Conn: server}
-
-	resp := "HTTP/1.1 200 Connection Established\r\n"
-	resp += "Proxy-agent: go-tunnel-proxy\r\n"
-	resp += "Connection: close\r\n\r\n"
-	client.Write([]byte(resp))
-
-	go io.Copy(server, client)
-	io.Copy(client, server)
-
-	log.Printf(
-		"[Client %s] Data transferred: sent %d bytes, received %d bytes",
-		remoteAddr,
-		clientCounting.bytesWritten,
-		serverCounting.bytesRead,
+// This Appwrite function will be executed every time your function is triggered
+func Main(Context openruntimes.Context) openruntimes.Response {
+	// You can use the Appwrite SDK to interact with other services
+	// For this example, we're using the Users service
+	client := appwrite.NewClient(
+		appwrite.WithEndpoint(os.Getenv("APPWRITE_FUNCTION_API_ENDPOINT")),
+		appwrite.WithProject(os.Getenv("APPWRITE_FUNCTION_PROJECT_ID")),
+		appwrite.WithKey(Context.Req.Headers["x-appwrite-key"]),
 	)
-}
+	users := appwrite.NewUsers(client)
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "10000" // default port
-	}
-
-	err := loadBlacklist("blacklist.txt")
+	response, err := users.List()
 	if err != nil {
-		log.Fatalf("Failed to load blacklist: %v", err)
+		Context.Error("Could not list users: " + err.Error())
+	} else {
+		// Log messages and errors to the Appwrite Console
+		// These logs won't be seen by your end users
+		Context.Log("Total users: " + strconv.Itoa(response.Total))
 	}
-	listenAddr := fmt.Sprintf(":%s", port)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
-		return
-	}
-	defer listener.Close()
 
-	log.Printf("Listening on %s", listenAddr)
-	for {
-		client, err := listener.Accept()
-		if err != nil {
-			log.Println("Error accepting:", err)
-			continue
-		}
-
-		go handleClientConnection(client)
+	// The req object contains the request data
+	if Context.Req.Path == "/ping" {
+		// Use res object to respond with text(), json(), or binary()
+		// Don't forget to return a response!
+		return Context.Res.Text("Pong")
 	}
+
+	return Context.Res.Json(Response{
+		Motto:       "Build like a team of hundreds_",
+		Learn:       "https://appwrite.io/docs",
+		Connect:     "https://appwrite.io/discord",
+		GetInspired: "https://builtwith.appwrite.io",
+	})
 }
